@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+backend/venv/
+frontend/venv/
+
+# Node
+node_modules/
+frontend/node_modules/
+
+# Env files / secrets
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+frontend/.env
+frontend/.env.*
+
+# Databases and local state
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Build/dist/cache
+build/
+dist/
+.cache/
+
+# Generated outputs / artifacts
+backend/output/
+backend/outputs/
+backend/uploads/
+outputs/
+*.tmp
+
+# Backup/old copies
+*.bak
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Large local docs/artifacts not needed in code repo
+CAM_*.pdf
+chinster yuvaan.pdf
+6995b96058f14_Hackathon_Problem_Statement__The__Intelli-Credit__Challenge.pdf

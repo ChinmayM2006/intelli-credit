@@ -1,0 +1,362 @@
+"""
+ML-based Credit Risk Predictor
+Uses XGBoost / Logistic Regression trained on Indian corporate data.
+Falls back to rule-based scoring if no model is available.
+Features map directly to the 5 document types extracted by parsers.
+"""
+import os
+import json
+import math
+import numpy as np
+from typing import Dict, Any, Optional, Tuple
+
+# Try importing ML libraries; graceful fallback if unavailable
+try:
+    import joblib
+    HAS_JOBLIB = True
+except ImportError:
+    HAS_JOBLIB = False
+
+try:
+    import shap
+    HAS_SHAP = True
+except ImportError:
+    HAS_SHAP = False
+
+
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "credit_model.pkl")
+
+# ─── Feature Definitions ─────────────────────────────────────────────────────
+
+FEATURE_NAMES = [
+    # From Annual Report / Financial Statement
+    "revenue_cr",           # Revenue from operations (₹ Cr)
+    "pat_cr",               # Profit After Tax (₹ Cr)
+    "de_ratio",             # Debt / Equity ratio
+    "current_ratio",        # Current Assets / Current Liabilities
+    "icr",                  # Interest Coverage Ratio (EBITDA / Interest)
+    "pat_margin_pct",       # PAT / Revenue × 100
+    "roe_pct",              # Return on Equity
+    # From ALM
+    "alm_short_term_gap",   # Short-term (1-90 day) mismatch as % of outflows
+    # From Shareholding Pattern
+    "promoter_holding_pct", # Promoter holding %
+    "pledged_pct",          # Pledged shares %
+    # From Borrowing Profile
+    "total_debt_cr",        # Total outstanding debt (₹ Cr)
+    "num_lenders",          # Number of lending banks
+    "overdue_pct",          # Overdue as % of outstanding
+    # From Portfolio (NBFC / Bank)
+    "gnpa_pct",             # Gross NPA %
+    "collection_eff_pct",   # Collection Efficiency %
+    # From GST
+    "itc_mismatch_pct",     # ITC claimed vs eligible mismatch %
+]
+
+FEATURE_DEFAULTS = {name: 0.0 for name in FEATURE_NAMES}
+FEATURE_DEFAULTS.update({
+    "current_ratio": 1.5,
+    "icr": 2.0,
+    "promoter_holding_pct": 50.0,
+    "collection_eff_pct": 95.0,
+})
+
+
+# ─── Feature Extraction from Parsed Data ─────────────────────────────────────
+
+def extract_features(parsed_data: Dict[str, Any]) -> Dict[str, float]:
+    """Extract ML features from combined parsed document data."""
+    features = dict(FEATURE_DEFAULTS)
+
+    # Annual report / financial statement features
+    ar = parsed_data.get("annual_report", {}).get("fields", {})
+    fs = parsed_data.get("financial_statement", {}).get("fields", {})
+
+    pnl = ar.get("profit_and_loss", {})
+    bs = ar.get("balance_sheet", {})
+    ratios = ar.get("ratios", {}) or fs.get("ratios", {})
+
+    if pnl.get("revenue"):
+        features["revenue_cr"] = float(pnl["revenue"])
+    if pnl.get("pat"):
+        features["pat_cr"] = float(pnl["pat"])
+
+    if ratios.get("de_ratio"):
+        features["de_ratio"] = float(ratios["de_ratio"])
+    if ratios.get("current_ratio"):
+        features["current_ratio"] = float(ratios["current_ratio"])
+    if ratios.get("icr"):
+        features["icr"] = float(ratios["icr"])
+    if ratios.get("pat_margin_pct"):
+        features["pat_margin_pct"] = float(ratios["pat_margin_pct"])
+    if ratios.get("roe_pct"):
+        features["roe_pct"] = float(ratios["roe_pct"])
+
+    # Also try from financial statement if annual report doesn't have them
+    if fs.get("ratios"):
+        fr = fs["ratios"]
+        if not ratios.get("de_ratio") and fr.get("debt_equity"):
+            features["de_ratio"] = float(fr["debt_equity"])
+        if not ratios.get("current_ratio") and fr.get("current_ratio"):
+            features["current_ratio"] = float(fr["current_ratio"])
+        if not ratios.get("icr") and fr.get("interest_coverage"):
+            features["icr"] = float(fr["interest_coverage"])
+
+    # ALM features
+    alm = parsed_data.get("alm", {}).get("fields", {})
+    buckets = alm.get("maturity_buckets", {})
+    short_term_outflows = 0
+    short_term_mismatch = 0
+    for bucket_key in ["1_30_days", "31_90_days"]:
+        b = buckets.get(bucket_key, {})
+        short_term_outflows += b.get("outflows", 0)
+        short_term_mismatch += b.get("mismatch", 0)
+    if short_term_outflows > 0:
+        features["alm_short_term_gap"] = round(short_term_mismatch / short_term_outflows * 100, 2)
+
+    # Shareholding features
+    sh = parsed_data.get("shareholding", {}).get("fields", {})
+    if sh.get("promoter_holding_pct"):
+        features["promoter_holding_pct"] = float(sh["promoter_holding_pct"])
+    if sh.get("pledged_shares_pct"):
+        features["pledged_pct"] = float(sh["pledged_shares_pct"])
+
+    # Borrowing profile features
+    bp = parsed_data.get("borrowing_profile", {}).get("fields", {})
+    if bp.get("total_outstanding"):
+        features["total_debt_cr"] = float(bp["total_outstanding"])
+    if bp.get("number_of_lenders"):
+        features["num_lenders"] = float(bp["number_of_lenders"])
+    if bp.get("total_overdue") and bp.get("total_outstanding"):
+        outstanding = float(bp["total_outstanding"])
+        if outstanding > 0:
+            features["overdue_pct"] = round(float(bp["total_overdue"]) / outstanding * 100, 2)
+
+    # Portfolio features
+    pf = parsed_data.get("portfolio", {}).get("fields", {})
+    if pf.get("gnpa_pct"):
+        features["gnpa_pct"] = float(pf["gnpa_pct"])
+    if pf.get("collection_efficiency_pct"):
+        features["collection_eff_pct"] = float(pf["collection_efficiency_pct"])
+
+    # GST features
+    gst = parsed_data.get("gst", {}).get("fields", {})
+    if gst.get("itc_mismatch_pct"):
+        features["itc_mismatch_pct"] = float(gst["itc_mismatch_pct"])
+
+    return features
+
+
+# ─── ML Prediction ────────────────────────────────────────────────────────────
+
+def predict_default(parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Predict probability of default using ML model or rule-based fallback."""
+    features = extract_features(parsed_data)
+    feature_vector = np.array([[features[f] for f in FEATURE_NAMES]])
+
+    # Try ML model first
+    if HAS_JOBLIB and os.path.exists(MODEL_PATH):
+        return _ml_predict(feature_vector, features)
+
+    # Rule-based fallback with calibrated weights
+    return _rule_based_predict(features)
+
+
+def _ml_predict(feature_vector: np.ndarray, features: Dict[str, float]) -> Dict[str, Any]:
+    """Run ML model prediction with SHAP explanations."""
+    model = joblib.load(MODEL_PATH)
+    pd_prob = float(model.predict_proba(feature_vector)[0][1])
+
+    # SHAP explanations
+    explanations = {}
+    if HAS_SHAP:
+        try:
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(feature_vector)
+            if isinstance(shap_values, list):
+                shap_values = shap_values[1]
+            for i, name in enumerate(FEATURE_NAMES):
+                explanations[name] = {
+                    "value": features[name],
+                    "impact": round(float(shap_values[0][i]), 4),
+                    "direction": "increases_risk" if shap_values[0][i] > 0 else "decreases_risk"
+                }
+        except Exception:
+            pass
+
+    rating = _pd_to_rating(pd_prob)
+
+    return {
+        "method": "ml_model",
+        "probability_of_default": round(pd_prob, 4),
+        "rating": rating,
+        "features_used": features,
+        "feature_importance": explanations,
+        "model_type": type(model).__name__,
+    }
+
+
+def _rule_based_predict(features: Dict[str, float]) -> Dict[str, Any]:
+    """Rule-based PD estimation calibrated to Indian corporate norms."""
+    # Start with base PD (Indian corporate average ~4%)
+    log_odds = math.log(0.04 / 0.96)  # base logit
+
+    # Each factor shifts log-odds
+    adjustments = []
+
+    # D/E ratio: higher = riskier
+    de = features["de_ratio"]
+    if de > 3:
+        adj = 0.5 * (de - 3)
+        log_odds += adj
+        adjustments.append(("de_ratio", adj, f"D/E {de} > 3x threshold"))
+    elif de < 0.5:
+        adj = -0.3
+        log_odds += adj
+        adjustments.append(("de_ratio", adj, f"Conservative D/E of {de}"))
+
+    # ICR: lower = riskier
+    icr = features["icr"]
+    if icr < 1.5:
+        adj = 1.0
+        log_odds += adj
+        adjustments.append(("icr", adj, f"ICR {icr} below 1.5x — debt servicing stress"))
+    elif icr > 3:
+        adj = -0.3
+        log_odds += adj
+        adjustments.append(("icr", adj, f"Healthy ICR of {icr}"))
+
+    # Current ratio
+    cr = features["current_ratio"]
+    if cr < 1.0:
+        adj = 0.6
+        log_odds += adj
+        adjustments.append(("current_ratio", adj, f"Current ratio {cr} < 1 — liquidity risk"))
+    elif cr > 2:
+        adj = -0.2
+        log_odds += adj
+        adjustments.append(("current_ratio", adj, f"Strong liquidity with CR {cr}"))
+
+    # PAT margin
+    pm = features["pat_margin_pct"]
+    if pm < 0:
+        adj = 0.8
+        log_odds += adj
+        adjustments.append(("pat_margin_pct", adj, "Negative PAT margin — unprofitable"))
+    elif pm > 10:
+        adj = -0.3
+        log_odds += adj
+        adjustments.append(("pat_margin_pct", adj, f"Healthy {pm}% PAT margin"))
+
+    # Promoter holding
+    ph = features["promoter_holding_pct"]
+    if ph < 25:
+        adj = 0.4
+        log_odds += adj
+        adjustments.append(("promoter_holding_pct", adj, f"Low promoter holding: {ph}%"))
+    elif ph > 60:
+        adj = -0.2
+        log_odds += adj
+        adjustments.append(("promoter_holding_pct", adj, f"Strong promoter holding: {ph}%"))
+
+    # Pledged shares
+    pledge = features["pledged_pct"]
+    if pledge > 50:
+        adj = 0.8
+        log_odds += adj
+        adjustments.append(("pledged_pct", adj, f"Critical pledge level: {pledge}%"))
+    elif pledge > 20:
+        adj = 0.3
+        log_odds += adj
+        adjustments.append(("pledged_pct", adj, f"High pledge level: {pledge}%"))
+
+    # Overdue
+    overdue = features["overdue_pct"]
+    if overdue > 0:
+        adj = 0.5 + 0.1 * overdue
+        log_odds += adj
+        adjustments.append(("overdue_pct", adj, f"Overdues present: {overdue}% of outstanding"))
+
+    # GNPA
+    gnpa = features["gnpa_pct"]
+    if gnpa > 5:
+        adj = 0.4
+        log_odds += adj
+        adjustments.append(("gnpa_pct", adj, f"High GNPA: {gnpa}%"))
+
+    # Collection efficiency
+    ce = features["collection_eff_pct"]
+    if ce < 90:
+        adj = 0.3
+        log_odds += adj
+        adjustments.append(("collection_eff_pct", adj, f"Low collection efficiency: {ce}%"))
+
+    # ITC mismatch
+    itc = features["itc_mismatch_pct"]
+    if itc > 10:
+        adj = 0.3
+        log_odds += adj
+        adjustments.append(("itc_mismatch_pct", adj, f"ITC mismatch: {itc}%"))
+
+    # ALM gap
+    alm_gap = features["alm_short_term_gap"]
+    if alm_gap < -10:
+        adj = 0.4
+        log_odds += adj
+        adjustments.append(("alm_short_term_gap", adj, f"Negative ALM gap: {alm_gap}%"))
+
+    # Convert log-odds to probability
+    pd_prob = 1 / (1 + math.exp(-log_odds))
+    pd_prob = max(0.001, min(0.999, pd_prob))
+
+    rating = _pd_to_rating(pd_prob)
+
+    explanations = {}
+    for feat_name, impact, detail in adjustments:
+        explanations[feat_name] = {
+            "value": features[feat_name],
+            "impact": round(impact, 4),
+            "direction": "increases_risk" if impact > 0 else "decreases_risk",
+            "detail": detail,
+        }
+
+    return {
+        "method": "rule_based_calibrated",
+        "probability_of_default": round(pd_prob, 4),
+        "rating": rating,
+        "features_used": features,
+        "feature_importance": explanations,
+        "adjustments": [{"feature": f, "impact": round(i, 4), "detail": d} for f, i, d in adjustments],
+    }
+
+
+def _pd_to_rating(pd_prob: float) -> str:
+    """Convert PD to internal rating grade (aligned to CRISIL scale)."""
+    if pd_prob < 0.005:
+        return "AAA"
+    elif pd_prob < 0.01:
+        return "AA+"
+    elif pd_prob < 0.02:
+        return "AA"
+    elif pd_prob < 0.03:
+        return "AA-"
+    elif pd_prob < 0.05:
+        return "A+"
+    elif pd_prob < 0.08:
+        return "A"
+    elif pd_prob < 0.12:
+        return "A-"
+    elif pd_prob < 0.18:
+        return "BBB+"
+    elif pd_prob < 0.25:
+        return "BBB"
+    elif pd_prob < 0.35:
+        return "BBB-"
+    elif pd_prob < 0.50:
+        return "BB+"
+    elif pd_prob < 0.65:
+        return "BB"
+    elif pd_prob < 0.80:
+        return "B"
+    else:
+        return "C/D"

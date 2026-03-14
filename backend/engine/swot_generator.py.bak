@@ -1,0 +1,219 @@
+"""
+SWOT Analysis Generator
+Produces Strengths, Weaknesses, Opportunities, Threats from all data sources.
+Uses LLM when available, rule-based fallback otherwise.
+"""
+from typing import Dict, Any, List
+from backend.llm.provider import get_llm
+
+
+def generate_swot(
+    parsed_data: Dict[str, Any],
+    research_data: Dict[str, Any],
+    ml_result: Dict[str, Any],
+    entity_name: str = "Company",
+) -> Dict[str, Any]:
+    """Generate SWOT analysis from all gathered data."""
+    # Try LLM-based SWOT first
+    try:
+        llm_swot = _llm_swot(parsed_data, research_data, ml_result, entity_name)
+        if llm_swot:
+            return llm_swot
+    except Exception:
+        pass
+
+    # Fallback to rule-based
+    return _rule_based_swot(parsed_data, research_data, ml_result, entity_name)
+
+
+def _llm_swot(
+    parsed_data: Dict[str, Any],
+    research_data: Dict[str, Any],
+    ml_result: Dict[str, Any],
+    entity_name: str,
+) -> Dict[str, Any]:
+    """Generate SWOT using LLM."""
+    llm = get_llm()
+    if llm.__class__.__name__ == "FallbackProvider":
+        return None
+
+    # Build context summary
+    context_parts = [f"Company: {entity_name}"]
+
+    # Financial summary
+    features = ml_result.get("features_used", {})
+    if features.get("revenue_cr"):
+        context_parts.append(f"Revenue: ₹{features['revenue_cr']} Cr")
+    if features.get("pat_cr"):
+        context_parts.append(f"PAT: ₹{features['pat_cr']} Cr")
+    if features.get("de_ratio"):
+        context_parts.append(f"D/E Ratio: {features['de_ratio']}")
+    if features.get("icr"):
+        context_parts.append(f"ICR: {features['icr']}")
+
+    pd_prob = ml_result.get("probability_of_default", 0)
+    rating = ml_result.get("rating", "N/A")
+    context_parts.append(f"ML PD: {pd_prob:.2%}, Rating: {rating}")
+
+    # Research summary
+    if research_data.get("summary"):
+        context_parts.append(f"Research: {research_data['summary'][:500]}")
+
+    # All risks from documents
+    all_risks = []
+    for doc_type, doc_data in parsed_data.items():
+        if isinstance(doc_data, dict) and "risks" in doc_data:
+            for risk in doc_data["risks"]:
+                all_risks.append(f"[{doc_type}] {risk.get('type', 'RISK')}: {risk.get('detail', '')}")
+
+    if all_risks:
+        context_parts.append(f"Identified Risks: {'; '.join(all_risks[:10])}")
+
+    context = "\n".join(context_parts)
+
+    prompt = f"""You are a credit analyst. Generate a SWOT analysis for the following Indian corporate borrower.
+Return EXACTLY this JSON format with 3-5 bullet points per category:
+
+{{
+  "strengths": ["point 1", "point 2", ...],
+  "weaknesses": ["point 1", "point 2", ...],
+  "opportunities": ["point 1", "point 2", ...],
+  "threats": ["point 1", "point 2", ...]
+}}
+
+Data:
+{context}
+
+Return ONLY valid JSON, no markdown."""
+
+    import json
+    response = llm.generate(prompt, max_tokens=1000)
+    try:
+        swot = json.loads(response)
+        swot["method"] = "llm"
+        return swot
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _rule_based_swot(
+    parsed_data: Dict[str, Any],
+    research_data: Dict[str, Any],
+    ml_result: Dict[str, Any],
+    entity_name: str,
+) -> Dict[str, Any]:
+    """Rule-based SWOT generation from signals."""
+    features = ml_result.get("features_used", {})
+    pd_prob = ml_result.get("probability_of_default", 0.05)
+    rating = ml_result.get("rating", "BBB")
+
+    strengths = []
+    weaknesses = []
+    opportunities = []
+    threats = []
+
+    # ── Financial Strength Signals ──
+    if features.get("icr", 0) > 3:
+        strengths.append(f"Strong debt servicing capacity with ICR of {features['icr']:.1f}x")
+    if features.get("current_ratio", 0) > 1.5:
+        strengths.append(f"Healthy liquidity position (Current Ratio: {features['current_ratio']:.1f}x)")
+    if features.get("pat_margin_pct", 0) > 10:
+        strengths.append(f"Strong profitability with {features['pat_margin_pct']:.1f}% PAT margin")
+    if features.get("de_ratio", 999) < 1.5:
+        strengths.append(f"Conservative leverage at {features['de_ratio']:.1f}x D/E")
+    if features.get("promoter_holding_pct", 0) > 60:
+        strengths.append(f"Strong promoter commitment with {features['promoter_holding_pct']:.0f}% holding")
+    if features.get("collection_eff_pct", 0) > 95:
+        strengths.append(f"Excellent collection efficiency at {features['collection_eff_pct']:.0f}%")
+    if features.get("revenue_cr", 0) > 500:
+        strengths.append(f"Substantial scale with ₹{features['revenue_cr']:.0f} Cr revenue")
+
+    # ── Weakness Signals ──
+    if features.get("icr", 999) < 1.5:
+        weaknesses.append(f"Weak debt servicing capacity (ICR: {features.get('icr', 0):.1f}x)")
+    if features.get("de_ratio", 0) > 3:
+        weaknesses.append(f"High leverage at {features['de_ratio']:.1f}x D/E ratio")
+    if features.get("current_ratio", 999) < 1:
+        weaknesses.append(f"Liquidity stress with Current Ratio of {features['current_ratio']:.1f}x")
+    if features.get("pat_margin_pct", 999) < 3:
+        weaknesses.append("Thin profit margins limiting debt absorption capacity")
+    if features.get("pledged_pct", 0) > 20:
+        weaknesses.append(f"Significant promoter share pledge at {features['pledged_pct']:.0f}%")
+    if features.get("overdue_pct", 0) > 0:
+        weaknesses.append(f"Existing overdues at {features['overdue_pct']:.1f}% of outstanding")
+    if features.get("gnpa_pct", 0) > 5:
+        weaknesses.append(f"Elevated GNPA at {features['gnpa_pct']:.1f}%")
+    if features.get("itc_mismatch_pct", 0) > 10:
+        weaknesses.append(f"GST ITC mismatch of {features['itc_mismatch_pct']:.1f}% — potential compliance issue")
+
+    # ── Opportunities ──
+    if research_data:
+        summary = str(research_data.get("summary", "")).lower()
+        if "growth" in summary or "expansion" in summary:
+            opportunities.append("Industry growth trajectory supports capacity expansion")
+        if "government" in summary or "policy" in summary:
+            opportunities.append("Favorable government policy environment")
+
+    if features.get("revenue_cr", 0) > 0 and features.get("pat_margin_pct", 0) > 5:
+        opportunities.append("Room for revenue scale-up given healthy margins")
+    if features.get("de_ratio", 0) < 2:
+        opportunities.append("Low leverage provides headroom for additional borrowing at competitive rates")
+    if features.get("collection_eff_pct", 0) > 90:
+        opportunities.append("Portfolio quality supports AUM expansion potential")
+
+    # Add generic opportunities if few found
+    if len(opportunities) < 2:
+        opportunities.append("Digital transformation and operational efficiency improvements")
+        opportunities.append("Market consolidation opportunity in the sector")
+
+    # ── Threats ──
+    # From document risks
+    all_risks = _collect_risks(parsed_data)
+    critical_risks = [r for r in all_risks if r.get("severity") in ("CRITICAL", "HIGH")]
+    for risk in critical_risks[:3]:
+        threats.append(f"{risk['type'].replace('_', ' ').title()}: {risk['detail']}")
+
+    if research_data:
+        summary = str(research_data.get("summary", "")).lower()
+        if "competition" in summary or "competitive" in summary:
+            threats.append("Intensifying competitive pressures in the sector")
+        if "regulation" in summary or "regulatory" in summary:
+            threats.append("Regulatory changes may impact operations or compliance costs")
+        if any(w in summary for w in ["recession", "slowdown", "downturn"]):
+            threats.append("Macroeconomic headwinds and demand uncertainty")
+
+    if pd_prob > 0.15:
+        threats.append(f"Elevated default probability of {pd_prob:.1%} based on financial indicators")
+    if features.get("alm_short_term_gap", 0) < -10:
+        threats.append("Negative short-term ALM gap poses refinancing risk")
+
+    # Add generic threats if few found
+    if len(threats) < 2:
+        threats.append("Interest rate volatility affecting borrowing costs")
+        threats.append("Supply chain disruptions and input cost inflation")
+
+    # Ensure at least 2 items per category
+    if len(strengths) < 2:
+        strengths.append(f"Internal credit rating: {rating}")
+    if len(weaknesses) < 2:
+        weaknesses.append("Limited data from uploaded documents may mask additional risks")
+
+    return {
+        "method": "rule_based",
+        "strengths": strengths[:5],
+        "weaknesses": weaknesses[:5],
+        "opportunities": opportunities[:5],
+        "threats": threats[:5],
+    }
+
+
+def _collect_risks(parsed_data: Dict[str, Any]) -> List[Dict]:
+    """Collect all risk signals across all parsed documents."""
+    all_risks = []
+    for doc_type, doc_data in parsed_data.items():
+        if isinstance(doc_data, dict) and "risks" in doc_data:
+            for risk in doc_data["risks"]:
+                risk_copy = dict(risk)
+                risk_copy["source_doc"] = doc_type
+                all_risks.append(risk_copy)
+    return all_risks

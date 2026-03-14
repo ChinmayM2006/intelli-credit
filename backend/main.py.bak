@@ -1,0 +1,667 @@
+"""
+Intelli-Credit Engine v2 — FastAPI Application
+Full-featured Credit Decisioning Engine with:
+- Multi-step onboarding with document upload
+- Auto-classification + human-in-the-loop
+- ML-based risk scoring + Altman Z-Score
+- Loan structuring (DSCR/Turnover/NW/ALM)
+- SWOT analysis + Data triangulation
+- Final Investment Report (CAM) generation
+"""
+import os
+import sys
+import json
+import uuid
+import shutil
+from datetime import datetime
+from typing import Dict, Any, List, Optional
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+# ── Fix import paths ──
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from backend.config import UPLOAD_DIR, OUTPUT_DIR
+from backend.database import init_db, get_db, Application, Document, PrimaryInsight
+from backend.llm.provider import get_llm_status
+from backend.ingestor.parser import parse_document
+from backend.ingestor.classifier import classify_document, classify_with_llm
+from backend.ingestor.llm_extractor import extract_with_llm
+from backend.engine.risk_scorer import CreditRiskScorer
+from backend.engine.swot_generator import generate_swot
+from backend.engine.ml.predictor import predict_default
+from backend.engine.ml.altman_z import calculate_altman_z
+from backend.engine.loan_structurer import structure_loan
+from backend.engine.cam_generator import CAMGenerator
+from backend.research.agent import ResearchAgent
+from backend.research.triangulator import triangulate
+
+
+# ── App Setup ──
+app = FastAPI(title="Intelli-Credit Engine", version="2.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Ensure directories exist
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Init database
+init_db()
+
+# Singletons
+scorer = CreditRiskScorer()
+research_agent = ResearchAgent()
+cam_generator = CAMGenerator()
+
+
+# ── Pydantic Models ──
+
+class ApplicationCreate(BaseModel):
+    company_name: str
+    cin: Optional[str] = ""
+    industry: Optional[str] = ""
+    incorporation_year: Optional[int] = None
+    promoter_names: Optional[str] = ""
+    loan_amount_requested: Optional[float] = 0
+    loan_purpose: Optional[str] = ""
+    loan_type: Optional[str] = "term_loan"
+    loan_tenure_requested: Optional[int] = 0
+
+class InsightCreate(BaseModel):
+    content: str
+    note_type: Optional[str] = "site_visit"
+    officer_name: Optional[str] = ""
+
+class ClassificationConfirm(BaseModel):
+    doc_type: str
+
+
+# ── Helper ──
+
+def _get_app_or_404(app_id: str, db) -> Application:
+    app_obj = db.query(Application).filter(Application.id == app_id).first()
+    if not app_obj:
+        raise HTTPException(status_code=404, detail="Application not found")
+    return app_obj
+
+
+def _build_app_dict(app_obj: Application, db) -> Dict[str, Any]:
+    """Build the full dict needed by scorer/research etc."""
+    d = app_obj.to_dict()
+    docs = db.query(Document).filter(Document.application_id == app_obj.id).all()
+    d["documents"] = [doc.to_dict() for doc in docs]
+    insights = db.query(PrimaryInsight).filter(PrimaryInsight.application_id == app_obj.id).all()
+    d["primary_insights"] = [i.to_dict() for i in insights]
+    return d
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Health ──
+
+@app.get("/health")
+def health():
+    llm = get_llm_status()
+    return {
+        "status": "healthy",
+        "version": "2.0",
+        "llm_provider": llm["provider"],
+        "llm_mode": llm["mode"],
+    }
+
+
+# ── Applications CRUD ──
+
+@app.post("/applications")
+def create_application(data: ApplicationCreate):
+    db = next(get_db())
+    try:
+        app_obj = Application(
+            id=str(uuid.uuid4())[:8],
+            company_name=data.company_name,
+            cin=data.cin or "",
+            industry=data.industry or "",
+            incorporation_year=data.incorporation_year,
+            promoter_names=data.promoter_names or "",
+            loan_amount_requested=data.loan_amount_requested or 0,
+            loan_purpose=data.loan_purpose or "",
+            loan_type=data.loan_type or "term_loan",
+            loan_tenure_requested=data.loan_tenure_requested or 0,
+            stage="onboarding",
+        )
+        db.add(app_obj)
+        db.commit()
+        db.refresh(app_obj)
+        return app_obj.to_dict()
+    finally:
+        db.close()
+
+
+@app.get("/applications")
+def list_applications():
+    db = next(get_db())
+    try:
+        apps = db.query(Application).order_by(Application.created_at.desc()).all()
+        return [a.to_dict() for a in apps]
+    finally:
+        db.close()
+
+
+@app.get("/applications/{app_id}")
+def get_application(app_id: str):
+    db = next(get_db())
+    try:
+        app_obj = _get_app_or_404(app_id, db)
+        return _build_app_dict(app_obj, db)
+    finally:
+        db.close()
+
+
+@app.delete("/applications/{app_id}")
+def delete_application(app_id: str):
+    db = next(get_db())
+    try:
+        app_obj = _get_app_or_404(app_id, db)
+        db.delete(app_obj)
+        db.commit()
+        return {"status": "deleted"}
+    finally:
+        db.close()
+
+
+# ── Document Upload + Auto-Classification ──
+
+@app.post("/applications/{app_id}/upload")
+async def upload_document(
+    app_id: str,
+    file: UploadFile = File(...),
+    doc_type: Optional[str] = Form(None),
+):
+    db = next(get_db())
+    try:
+        app_obj = _get_app_or_404(app_id, db)
+
+        # Save file
+        app_upload_dir = os.path.join(UPLOAD_DIR, app_id)
+        os.makedirs(app_upload_dir, exist_ok=True)
+        file_path = os.path.join(app_upload_dir, file.filename)
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+
+        # Auto-classify if no type provided
+        if not doc_type:
+            classification = classify_document(file_path, file.filename)
+            # Try LLM classification if uncertain
+            if classification.get("needs_review", True):
+                llm_class = await classify_with_llm(file_path, file.filename)
+                if llm_class and llm_class.get("confidence", 0) > classification.get("confidence", 0):
+                    classification = llm_class
+            doc_type = classification.get("predicted_type", "other")
+            confidence = classification.get("confidence", 0)
+            needs_review = classification.get("needs_review", True)
+        else:
+            confidence = 1.0
+            needs_review = False
+            classification = {"predicted_type": doc_type, "confidence": 1.0}
+
+        # Parse document
+        try:
+            parsed = parse_document(file_path, doc_type)
+        except Exception as e:
+            parsed = {"doc_type": doc_type, "error": str(e), "fields": {}, "risks": []}
+
+        # Try LLM extraction for richer data
+        try:
+            llm_extracted = await extract_with_llm(file_path, doc_type)
+            if llm_extracted:
+                # Merge LLM data into parsed fields
+                existing_fields = parsed.get("fields", {})
+                for k, v in llm_extracted.items():
+                    if k not in existing_fields or not existing_fields[k]:
+                        existing_fields[k] = v
+                parsed["fields"] = existing_fields
+                parsed["llm_enhanced"] = True
+        except Exception:
+            pass
+
+        # Save document record
+        doc = Document(
+            id=str(uuid.uuid4())[:8],
+            application_id=app_id,
+            filename=file.filename,
+            file_path=file_path,
+            doc_type=doc_type,
+            classification_confidence=confidence,
+            classification_evidence=json.dumps(classification) if isinstance(classification, dict) else None,
+            confirmed=not needs_review,
+            parsed_summary=parsed.get("summary", ""),
+            extracted_fields_json=json.dumps(parsed.get("fields", {})),
+            risks_json=json.dumps(parsed.get("risks", [])),
+        )
+        db.add(doc)
+
+        # Update application's parsed_data
+        current_parsed = json.loads(app_obj.parsed_data or "{}")
+        current_parsed[doc_type] = parsed
+        app_obj.parsed_data = json.dumps(current_parsed)
+        app_obj.stage = "documents_uploaded"
+
+        db.commit()
+        db.refresh(doc)
+
+        return {
+            "document": doc.to_dict(),
+            "classification": classification,
+            "parsed_summary": parsed.get("summary", ""),
+            "risks_found": len(parsed.get("risks", [])),
+        }
+    finally:
+        db.close()
+
+
+@app.put("/applications/{app_id}/documents/{doc_id}/confirm")
+def confirm_classification(app_id: str, doc_id: str, data: ClassificationConfirm):
+    """Human-in-the-loop: confirm or override document classification."""
+    db = next(get_db())
+    try:
+        doc = db.query(Document).filter(Document.id == doc_id, Document.application_id == app_id).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        old_type = doc.doc_type
+        new_type = data.doc_type
+
+        if old_type != new_type:
+            # Re-parse with correct type
+            try:
+                parsed = parse_document(doc.file_path, new_type)
+                doc.parsed_data = json.dumps(parsed)
+            except Exception:
+                pass
+
+            # Update application's parsed_data
+            app_obj = _get_app_or_404(app_id, db)
+            current_parsed = json.loads(app_obj.parsed_data or "{}")
+            if old_type in current_parsed:
+                del current_parsed[old_type]
+            current_parsed[new_type] = json.loads(doc.parsed_data or "{}")
+            app_obj.parsed_data = json.dumps(current_parsed)
+
+        doc.doc_type = new_type
+        doc.confirmed = True
+        doc.needs_review = False
+        doc.classification_confidence = 1.0
+        db.commit()
+
+        return {"status": "confirmed", "doc_type": new_type}
+    finally:
+        db.close()
+
+
+@app.get("/applications/{app_id}/documents")
+def list_documents(app_id: str):
+    db = next(get_db())
+    try:
+        _get_app_or_404(app_id, db)
+        docs = db.query(Document).filter(Document.application_id == app_id).all()
+        return [d.to_dict() for d in docs]
+    finally:
+        db.close()
+
+
+# ── Research ──
+
+@app.post("/applications/{app_id}/research")
+async def run_research(app_id: str):
+    db = next(get_db())
+    try:
+        app_obj = _get_app_or_404(app_id, db)
+        promoters = [n.strip() for n in (app_obj.promoter_names or "").split(",") if n.strip()]
+
+        result = await research_agent.research_company(
+            company_name=app_obj.company_name,
+            promoter_names=promoters,
+            industry=app_obj.industry or "",
+        )
+
+        app_obj.research = json.dumps(result)
+        app_obj.stage = "research_done"
+        db.commit()
+
+        return result
+    finally:
+        db.close()
+
+
+# ── Primary Insights ──
+
+@app.post("/applications/{app_id}/insights")
+def add_insight(app_id: str, data: InsightCreate):
+    db = next(get_db())
+    try:
+        _get_app_or_404(app_id, db)
+        insight = PrimaryInsight(
+            id=str(uuid.uuid4())[:8],
+            application_id=app_id,
+            content=data.content,
+            note_type=data.note_type or "site_visit",
+            officer_name=data.officer_name or "",
+        )
+        db.add(insight)
+        db.commit()
+        db.refresh(insight)
+        return insight.to_dict()
+    finally:
+        db.close()
+
+
+@app.get("/applications/{app_id}/insights")
+def list_insights(app_id: str):
+    db = next(get_db())
+    try:
+        _get_app_or_404(app_id, db)
+        insights = db.query(PrimaryInsight).filter(PrimaryInsight.application_id == app_id).all()
+        return [i.to_dict() for i in insights]
+    finally:
+        db.close()
+
+
+# ── Scoring + Analysis ──
+
+@app.post("/applications/{app_id}/score")
+def score_application(app_id: str):
+    db = next(get_db())
+    try:
+        app_obj = _get_app_or_404(app_id, db)
+        app_dict = _build_app_dict(app_obj, db)
+
+        result = scorer.score(app_dict)
+
+        app_obj.risk_score = json.dumps(result)
+        app_obj.stage = "scored"
+        db.commit()
+
+        return result
+    finally:
+        db.close()
+
+
+@app.post("/applications/{app_id}/swot")
+def generate_swot_analysis(app_id: str):
+    db = next(get_db())
+    try:
+        app_obj = _get_app_or_404(app_id, db)
+        parsed_data = json.loads(app_obj.parsed_data or "{}")
+        research_data = json.loads(app_obj.research or "{}")
+        risk_score = json.loads(app_obj.risk_score or "{}")
+
+        # Need ML result for SWOT
+        ml_result = risk_score.get("ml_prediction", {})
+        if not ml_result:
+            ml_result = predict_default(parsed_data)
+
+        result = generate_swot(parsed_data, research_data, ml_result, app_obj.company_name)
+
+        app_obj.swot = json.dumps(result)
+        db.commit()
+
+        return result
+    finally:
+        db.close()
+
+
+@app.post("/applications/{app_id}/triangulate")
+def run_triangulation(app_id: str):
+    db = next(get_db())
+    try:
+        app_obj = _get_app_or_404(app_id, db)
+        parsed_data = json.loads(app_obj.parsed_data or "{}")
+        research_data = json.loads(app_obj.research or "{}")
+        risk_score = json.loads(app_obj.risk_score or "{}")
+
+        ml_result = risk_score.get("ml_prediction", {})
+        if not ml_result:
+            ml_result = predict_default(parsed_data)
+
+        result = triangulate(parsed_data, research_data, ml_result)
+
+        app_obj.triangulation = json.dumps(result)
+        db.commit()
+
+        return result
+    finally:
+        db.close()
+
+
+# ── CAM / Report Generation ──
+
+@app.post("/applications/{app_id}/generate-report")
+def generate_report(app_id: str):
+    db = next(get_db())
+    try:
+        app_obj = _get_app_or_404(app_id, db)
+        app_dict = _build_app_dict(app_obj, db)
+
+        # Add all computed data
+        app_dict["risk_score"] = json.loads(app_obj.risk_score or "{}")
+        app_dict["swot"] = json.loads(app_obj.swot or "{}")
+        app_dict["triangulation"] = json.loads(app_obj.triangulation or "{}")
+
+        output_path = cam_generator.generate(app_dict, OUTPUT_DIR)
+        app_obj.cam_path = output_path
+        app_obj.stage = "report_generated"
+        db.commit()
+
+        return {"status": "generated", "path": output_path, "filename": os.path.basename(output_path)}
+    finally:
+        db.close()
+
+
+@app.get("/applications/{app_id}/download-report")
+def download_report(app_id: str):
+    db = next(get_db())
+    try:
+        app_obj = _get_app_or_404(app_id, db)
+        company = app_obj.company_name.replace(" ", "_")
+        pattern = f"CAM_{app_id}_{company}.pdf"
+        filepath = os.path.join(OUTPUT_DIR, pattern)
+        if not os.path.exists(filepath):
+            # Try to find any matching file
+            for f in os.listdir(OUTPUT_DIR):
+                if app_id in f and f.endswith(".pdf"):
+                    filepath = os.path.join(OUTPUT_DIR, f)
+                    break
+            else:
+                raise HTTPException(status_code=404, detail="Report not generated yet")
+        return FileResponse(filepath, filename=pattern, media_type="application/pdf")
+    finally:
+        db.close()
+
+
+# ── Full Pipeline (one-click) ──
+
+@app.post("/applications/{app_id}/run-pipeline")
+async def run_full_pipeline(app_id: str):
+    """Run the complete analysis pipeline: research → score → swot → triangulate."""
+    db = next(get_db())
+    try:
+        app_obj = _get_app_or_404(app_id, db)
+        app_dict = _build_app_dict(app_obj, db)
+        results = {"stages": []}
+
+        # 1. Research
+        try:
+            promoters = [n.strip() for n in (app_obj.promoter_names or "").split(",") if n.strip()]
+            research = await research_agent.research_company(
+                app_obj.company_name, promoters, app_obj.industry or ""
+            )
+            app_obj.research = json.dumps(research)
+            results["stages"].append({"stage": "research", "status": "done"})
+        except Exception as e:
+            results["stages"].append({"stage": "research", "status": "error", "error": str(e)})
+            research = {}
+
+        # 2. Score
+        try:
+            app_dict["research"] = research
+            score_result = scorer.score(app_dict)
+            app_obj.risk_score = json.dumps(score_result)
+            results["stages"].append({"stage": "scoring", "status": "done"})
+        except Exception as e:
+            results["stages"].append({"stage": "scoring", "status": "error", "error": str(e)})
+            score_result = {}
+
+        # 3. SWOT
+        try:
+            parsed_data = json.loads(app_obj.parsed_data or "{}")
+            ml_result = score_result.get("ml_prediction", predict_default(parsed_data))
+            swot = generate_swot(parsed_data, research, ml_result, app_obj.company_name)
+            app_obj.swot = json.dumps(swot)
+            results["stages"].append({"stage": "swot", "status": "done"})
+        except Exception as e:
+            results["stages"].append({"stage": "swot", "status": "error", "error": str(e)})
+
+        # 4. Triangulation
+        try:
+            tri = triangulate(parsed_data, research, ml_result)
+            app_obj.triangulation = json.dumps(tri)
+            results["stages"].append({"stage": "triangulation", "status": "done"})
+        except Exception as e:
+            results["stages"].append({"stage": "triangulation", "status": "error", "error": str(e)})
+
+        app_obj.stage = "scored"
+        db.commit()
+
+        # Return full application state
+        results["application"] = _build_app_dict(app_obj, db)
+        results["application"]["risk_score"] = json.loads(app_obj.risk_score or "{}")
+        results["application"]["swot"] = json.loads(app_obj.swot or "{}")
+        results["application"]["triangulation"] = json.loads(app_obj.triangulation or "{}")
+        results["application"]["research"] = json.loads(app_obj.research or "{}")
+
+        return results
+    finally:
+        db.close()
+
+
+# ── Demo Data ──
+
+@app.post("/demo/populate")
+def populate_demo():
+    """Create a demo application with pre-filled data for hackathon showcase."""
+    db = next(get_db())
+    try:
+        app_obj = Application(
+            id="demo-001",
+            company_name="Bharat Industries Pvt Ltd",
+            cin="U28100MH2015PTC268500",
+            industry="Manufacturing - Auto Components",
+            incorporation_year=2015,
+            promoter_names="Rajesh Kumar, Priya Sharma",
+            loan_amount_requested=50.0,
+            loan_purpose="Capacity expansion and working capital",
+            loan_type="term_loan",
+            loan_tenure_requested=5,
+            stage="onboarding",
+            parsed_data=json.dumps(_demo_parsed_data()),
+            research=json.dumps(_demo_research()),
+        )
+        # Check if already exists
+        existing = db.query(Application).filter(Application.id == "demo-001").first()
+        if existing:
+            db.delete(existing)
+            db.commit()
+        db.add(app_obj)
+        db.commit()
+        return {"status": "demo_created", "app_id": "demo-001"}
+    finally:
+        db.close()
+
+
+def _demo_parsed_data() -> Dict:
+    return {
+        "annual_report": {
+            "doc_type": "annual_report",
+            "summary": "Annual report: 5/6 sections, 6 ratios computed",
+            "fields": {
+                "sections_found": {"directors_report": True, "auditor_report": True, "balance_sheet": True, "pnl": True, "cash_flow": True, "notes_to_accounts": False},
+                "profit_and_loss": {"revenue": 320, "ebitda": 48, "pat": 22, "interest_expense": 12, "depreciation": 8},
+                "balance_sheet": {"total_equity": 85, "total_debt": 120, "current_assets": 95, "current_liabilities": 72, "total_assets": 280},
+                "cash_flow": {"cfo": 35},
+                "ratios": {"de_ratio": 1.41, "current_ratio": 1.32, "icr": 4.0, "pat_margin_pct": 6.88, "roe_pct": 25.88, "debt_ebitda": 2.5},
+                "audit_opinion": "unqualified",
+                "contingent_liabilities": 5.2,
+            },
+            "risks": [],
+        },
+        "shareholding": {
+            "doc_type": "shareholding",
+            "summary": "Shareholding pattern - Promoter: 72%, Pledged: 8%",
+            "fields": {"promoter_holding_pct": 72, "public_holding_pct": 28, "fii_holding_pct": 5, "dii_holding_pct": 8, "pledged_shares_pct": 8, "promoter_entities": ["Bharat Holdings LLP"], "qoq_change_promoter": 0},
+            "risks": [],
+        },
+        "borrowing_profile": {
+            "doc_type": "borrowing_profile",
+            "summary": "Borrowing profile: 3 lenders, ₹120 outstanding",
+            "fields": {"total_sanctioned": 150, "total_outstanding": 120, "total_overdue": 0, "number_of_lenders": 3, "has_working_capital": True, "has_term_loan": True, "facilities": [{"lender": "SBI", "sanctioned": 80, "outstanding": 65}, {"lender": "HDFC", "sanctioned": 40, "outstanding": 35}, {"lender": "ICICI", "sanctioned": 30, "outstanding": 20}]},
+            "risks": [],
+        },
+        "gst": {
+            "doc_type": "gst",
+            "gstr_type": "GSTR-3B",
+            "summary": "GSTR-3B for GSTIN 27AADCB2230M1Z5. ITC mismatch: 3.5%",
+            "fields": {"gstin": "27AADCB2230M1Z5", "gstr_type": "GSTR-3B", "reported_turnover": [25, 28, 27, 26, 30, 29, 31, 28, 32, 30, 33, 35], "itc_claimed": 4.2, "itc_eligible": 4.35, "itc_mismatch_pct": 3.5, "igst": 1.2, "cgst": 1.5, "sgst": 1.5},
+            "risks": [],
+        },
+        "alm": {
+            "doc_type": "alm",
+            "summary": "ALM statement with 5 maturity buckets identified",
+            "fields": {
+                "maturity_buckets": {
+                    "1_30_days": {"inflows": 15, "outflows": 12, "mismatch": 3},
+                    "31_90_days": {"inflows": 25, "outflows": 22, "mismatch": 3},
+                    "91_180_days": {"inflows": 30, "outflows": 28, "mismatch": 2},
+                    "1_3_years": {"inflows": 50, "outflows": 40, "mismatch": 10},
+                    "3_5_years": {"inflows": 35, "outflows": 30, "mismatch": 5},
+                },
+                "has_negative_short_term": False,
+            },
+            "risks": [],
+        },
+    }
+
+
+def _demo_research() -> Dict:
+    return {
+        "company_name": "Bharat Industries Pvt Ltd",
+        "news_sentiment": {
+            "company_news": [
+                {"title": "Bharat Industries reports 15% revenue growth", "snippet": "Company posted strong Q3 results with revenue growth of 15% YoY. EBITDA margins expanded 200bps.", "url": "https://economictimes.com/"},
+                {"title": "Auto component sector sees robust demand", "snippet": "Indian auto component manufacturers benefit from PLI scheme. Export orders growing steadily.", "url": "https://moneycontrol.com/"},
+            ],
+            "sentiment": {"label": "POSITIVE", "positive_signals": 8, "negative_signals": 2, "score": 0.8},
+        },
+        "regulatory_filings": {"filings": [{"title": "MCA21 - Active Status", "snippet": "Company Active. All filings up to date."}], "compliance_status": "Compliant"},
+        "litigation_check": {"search_results": [{"title": "No major litigation found", "snippet": "Clean legal record. One minor labor dispute pending."}], "litigation_risk": "LOW"},
+        "industry_analysis": {"industry": "Manufacturing - Auto Components", "trends": [{"title": "Auto sector growth outlook", "snippet": "Indian auto component industry expected to reach $200B by 2026. Strong growth driven by EV transition and export demand."}]},
+        "overall_risk_flags": [],
+        "research_summary": "Bharat Industries shows a positive profile with 15% revenue growth and expanding margins. Clean compliance record with no major litigation. Industry tailwinds from PLI scheme and EV transition support growth outlook. One minor labor dispute noted. Overall low-risk profile from secondary research perspective.",
+    }
+
+
+# ── Run ──
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

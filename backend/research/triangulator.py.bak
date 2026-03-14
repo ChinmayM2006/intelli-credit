@@ -1,0 +1,418 @@
+"""
+Data Triangulation Module
+Cross-references data points from multiple document sources and research
+to identify discrepancies, confirm signals, and generate confidence scores.
+"""
+from typing import Dict, Any, List, Tuple
+
+
+def triangulate(
+    parsed_data: Dict[str, Any],
+    research_data: Dict[str, Any],
+    ml_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Triangulate data across all sources.
+    Returns cross-reference checks, discrepancies, and overall confidence.
+    """
+    checks = []
+    discrepancies = []
+    confirmations = []
+
+    # 1. Revenue cross-check: Annual Report vs GST turnover
+    checks.append(_check_revenue_vs_gst(parsed_data))
+
+    # 2. Debt cross-check: Annual Report vs Borrowing Profile
+    checks.append(_check_debt_consistency(parsed_data))
+
+    # 3. Profitability cross-check: Annual Report vs ITR
+    checks.append(_check_profit_vs_itr(parsed_data))
+
+    # 4. Shareholding vs Annual Report directors
+    checks.append(_check_shareholding_consistency(parsed_data))
+
+    # 5. NPA cross-check: Portfolio vs Borrowing Profile
+    checks.append(_check_asset_quality(parsed_data))
+
+    # 6. Research vs Financials consistency
+    checks.append(_check_research_alignment(parsed_data, research_data, ml_result))
+
+    # 7. ALM vs Borrowing Profile maturity alignment
+    checks.append(_check_alm_borrowing(parsed_data))
+
+    # Filter out None checks
+    checks = [c for c in checks if c is not None]
+
+    for check in checks:
+        if check["status"] == "discrepancy":
+            discrepancies.append(check)
+        elif check["status"] == "confirmed":
+            confirmations.append(check)
+
+    # Overall confidence score
+    total_checks = len(checks)
+    confirmed_count = len(confirmations)
+    discrepancy_count = len(discrepancies)
+
+    if total_checks > 0:
+        confidence = confirmed_count / total_checks * 100
+        # Penalize for discrepancies
+        confidence -= discrepancy_count * 10
+        confidence = max(0, min(100, confidence))
+    else:
+        confidence = 50  # No data to triangulate
+
+    # Risk level
+    if discrepancy_count >= 3:
+        data_integrity = "LOW"
+    elif discrepancy_count >= 1:
+        data_integrity = "MEDIUM"
+    else:
+        data_integrity = "HIGH"
+
+    return {
+        "overall_confidence_pct": round(confidence, 1),
+        "data_integrity": data_integrity,
+        "total_checks": total_checks,
+        "confirmations": len(confirmations),
+        "discrepancies": len(discrepancies),
+        "checks": checks,
+        "summary": _generate_summary(confirmations, discrepancies, confidence),
+    }
+
+
+def _check_revenue_vs_gst(parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Cross-check: Annual Report revenue vs GST turnover."""
+    ar = parsed_data.get("annual_report", {}).get("fields", {})
+    gst = parsed_data.get("gst", {}).get("fields", {})
+
+    ar_revenue = ar.get("profit_and_loss", {}).get("revenue")
+    gst_turnover = gst.get("reported_turnover", [])
+    gst_max = max(gst_turnover) if gst_turnover else None
+
+    if not ar_revenue or not gst_max:
+        return {
+            "check": "Revenue vs GST Turnover",
+            "status": "insufficient_data",
+            "detail": "Cannot compare — missing Annual Report revenue or GST turnover data",
+            "severity": "info",
+        }
+
+    # GST is monthly/quarterly, annual report is annual — be lenient
+    ar_revenue = float(ar_revenue)
+    gst_max = float(gst_max)
+
+    # Compare order of magnitude
+    if ar_revenue > 0 and gst_max > 0:
+        ratio = ar_revenue / gst_max if gst_max > 0 else 0
+        if 0.5 < ratio < 20:  # Reasonable range (AR annual, GST could be monthly)
+            return {
+                "check": "Revenue vs GST Turnover",
+                "status": "confirmed",
+                "detail": f"AR Revenue ₹{ar_revenue:.0f}Cr and GST figures ₹{gst_max:.0f}Cr are broadly consistent",
+                "severity": "ok",
+            }
+        else:
+            return {
+                "check": "Revenue vs GST Turnover",
+                "status": "discrepancy",
+                "detail": f"Significant gap: AR Revenue ₹{ar_revenue:.0f}Cr vs GST ₹{gst_max:.0f}Cr (ratio: {ratio:.1f}x)",
+                "severity": "high",
+            }
+
+    return None
+
+
+def _check_debt_consistency(parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Cross-check: debt in Annual Report vs Borrowing Profile."""
+    ar = parsed_data.get("annual_report", {}).get("fields", {})
+    bp = parsed_data.get("borrowing_profile", {}).get("fields", {})
+
+    ar_debt = ar.get("balance_sheet", {}).get("total_debt")
+    bp_outstanding = bp.get("total_outstanding")
+
+    if not ar_debt or not bp_outstanding:
+        return {
+            "check": "Debt: AR vs Borrowing Profile",
+            "status": "insufficient_data",
+            "detail": "Cannot compare debt — data missing from one or both sources",
+            "severity": "info",
+        }
+
+    ar_debt = float(ar_debt)
+    bp_outstanding = float(bp_outstanding)
+
+    if ar_debt > 0 or bp_outstanding > 0:
+        diff_pct = abs(ar_debt - bp_outstanding) / max(ar_debt, bp_outstanding, 1) * 100
+        if diff_pct < 15:
+            return {
+                "check": "Debt: AR vs Borrowing Profile",
+                "status": "confirmed",
+                "detail": f"Debt figures consistent: AR ₹{ar_debt:.0f}Cr vs BP ₹{bp_outstanding:.0f}Cr (diff: {diff_pct:.0f}%)",
+                "severity": "ok",
+            }
+        else:
+            return {
+                "check": "Debt: AR vs Borrowing Profile",
+                "status": "discrepancy",
+                "detail": f"Debt mismatch: AR ₹{ar_debt:.0f}Cr vs BP ₹{bp_outstanding:.0f}Cr (diff: {diff_pct:.0f}%)",
+                "severity": "medium" if diff_pct < 30 else "high",
+            }
+
+    return None
+
+
+def _check_profit_vs_itr(parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Cross-check: profit in Annual Report vs ITR."""
+    ar = parsed_data.get("annual_report", {}).get("fields", {})
+    itr = parsed_data.get("itr", {}).get("fields", {})
+
+    ar_pat = ar.get("profit_and_loss", {}).get("pat")
+    itr_income = itr.get("income_figures", {})
+    itr_total = itr_income.get("total income") or itr_income.get("business income") or itr_income.get("gross total income")
+
+    if not ar_pat or not itr_total:
+        return {
+            "check": "Profit: AR vs ITR",
+            "status": "insufficient_data",
+            "detail": "Cannot compare profit — ITR or AR PAT data missing",
+            "severity": "info",
+        }
+
+    ar_pat = float(ar_pat)
+    itr_total = float(itr_total)
+
+    # ITR income and AR PAT should be in similar range
+    if ar_pat > 0 and itr_total > 0:
+        ratio = ar_pat / itr_total if itr_total != 0 else 0
+        if 0.3 < ratio < 3:
+            return {
+                "check": "Profit: AR vs ITR",
+                "status": "confirmed",
+                "detail": f"Profit figures broadly aligned: AR PAT ₹{ar_pat:.0f}Cr, ITR ₹{itr_total:.0f}Cr",
+                "severity": "ok",
+            }
+        else:
+            return {
+                "check": "Profit: AR vs ITR",
+                "status": "discrepancy",
+                "detail": f"Profit mismatch: AR PAT ₹{ar_pat:.0f}Cr vs ITR Income ₹{itr_total:.0f}Cr",
+                "severity": "high",
+            }
+
+    return {
+        "check": "Profit: AR vs ITR",
+        "status": "insufficient_data",
+        "detail": "Negative or zero values — can't compare meaningfully",
+        "severity": "info",
+    }
+
+
+def _check_shareholding_consistency(parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Check if shareholding data is internally consistent."""
+    sh = parsed_data.get("shareholding", {}).get("fields", {})
+
+    promoter = sh.get("promoter_holding_pct")
+    public = sh.get("public_holding_pct")
+
+    if not promoter:
+        return {
+            "check": "Shareholding Consistency",
+            "status": "insufficient_data",
+            "detail": "Shareholding data not available",
+            "severity": "info",
+        }
+
+    if promoter and public:
+        total = float(promoter) + float(public)
+        if 95 < total < 105:  # Allow small rounding errors
+            return {
+                "check": "Shareholding Consistency",
+                "status": "confirmed",
+                "detail": f"Promoter {promoter}% + Public {public}% = {total:.0f}% (consistent)",
+                "severity": "ok",
+            }
+        else:
+            return {
+                "check": "Shareholding Consistency",
+                "status": "discrepancy",
+                "detail": f"Shareholding doesn't add up: Promoter {promoter}% + Public {public}% = {total:.0f}%",
+                "severity": "medium",
+            }
+
+    return {
+        "check": "Shareholding Consistency",
+        "status": "confirmed",
+        "detail": f"Promoter holding: {promoter}%",
+        "severity": "ok",
+    }
+
+
+def _check_asset_quality(parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Cross-check NPA / portfolio quality vs borrowing data."""
+    pf = parsed_data.get("portfolio", {}).get("fields", {})
+    bp = parsed_data.get("borrowing_profile", {}).get("fields", {})
+
+    gnpa = pf.get("gnpa_pct")
+    overdue = bp.get("total_overdue", 0)
+
+    if not gnpa and not overdue:
+        return {
+            "check": "Asset Quality Cross-Check",
+            "status": "insufficient_data",
+            "detail": "No asset quality data from portfolio or borrowing profile",
+            "severity": "info",
+        }
+
+    if gnpa and gnpa > 5 and (not overdue or overdue == 0):
+        return {
+            "check": "Asset Quality Cross-Check",
+            "status": "discrepancy",
+            "detail": f"Portfolio shows {gnpa}% GNPA but borrowing profile shows no overdue — investigate",
+            "severity": "medium",
+        }
+
+    if overdue and overdue > 0 and gnpa and gnpa < 1:
+        return {
+            "check": "Asset Quality Cross-Check",
+            "status": "discrepancy",
+            "detail": f"Borrowing profile shows ₹{overdue}Cr overdue but portfolio GNPA is only {gnpa}%",
+            "severity": "medium",
+        }
+
+    return {
+        "check": "Asset Quality Cross-Check",
+        "status": "confirmed",
+        "detail": f"Asset quality signals consistent (GNPA: {gnpa or 'N/A'}%, Overdue: ₹{overdue or 0}Cr)",
+        "severity": "ok",
+    }
+
+
+def _check_research_alignment(parsed_data: Dict[str, Any], research_data: Dict[str, Any], ml_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Check if research findings align with financial data."""
+    if not research_data or not research_data.get("summary"):
+        return {
+            "check": "Research vs Financials Alignment",
+            "status": "insufficient_data",
+            "detail": "No research data available for cross-referencing",
+            "severity": "info",
+        }
+
+    research_text = str(research_data.get("summary", "")).lower()
+    features = ml_result.get("features_used", {})
+    pd_prob = ml_result.get("probability_of_default", 0.05)
+
+    # Look for sentiment alignment
+    negative_words = ["concern", "risk", "weak", "decline", "loss", "default", "trouble", "lawsuit"]
+    positive_words = ["strong", "growth", "robust", "healthy", "profit", "expansion", "leader"]
+
+    neg_count = sum(1 for w in negative_words if w in research_text)
+    pos_count = sum(1 for w in positive_words if w in research_text)
+
+    if pd_prob > 0.15 and neg_count > pos_count:
+        return {
+            "check": "Research vs Financials Alignment",
+            "status": "confirmed",
+            "detail": "Research sentiment aligns with elevated financial risk signals",
+            "severity": "ok",
+        }
+    elif pd_prob < 0.05 and pos_count > neg_count:
+        return {
+            "check": "Research vs Financials Alignment",
+            "status": "confirmed",
+            "detail": "Research sentiment aligns with strong financial indicators",
+            "severity": "ok",
+        }
+    elif pd_prob > 0.15 and pos_count > neg_count + 2:
+        return {
+            "check": "Research vs Financials Alignment",
+            "status": "discrepancy",
+            "detail": "Research is positive but financial indicators show elevated risk — possible reporting lag or data issue",
+            "severity": "medium",
+        }
+    elif pd_prob < 0.05 and neg_count > pos_count + 2:
+        return {
+            "check": "Research vs Financials Alignment",
+            "status": "discrepancy",
+            "detail": "Research is negative but financials appear strong — investigate recent developments",
+            "severity": "medium",
+        }
+
+    return {
+        "check": "Research vs Financials Alignment",
+        "status": "confirmed",
+        "detail": "No significant sentiment misalignment between research and financials",
+        "severity": "ok",
+    }
+
+
+def _check_alm_borrowing(parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Check ALM structure against borrowing profile."""
+    alm = parsed_data.get("alm", {}).get("fields", {})
+    bp = parsed_data.get("borrowing_profile", {}).get("fields", {})
+
+    buckets = alm.get("maturity_buckets", {})
+    total_outstanding = bp.get("total_outstanding")
+
+    if not buckets:
+        return {
+            "check": "ALM vs Borrowing Structure",
+            "status": "insufficient_data",
+            "detail": "ALM data not available for comparison",
+            "severity": "info",
+        }
+
+    if not total_outstanding:
+        return {
+            "check": "ALM vs Borrowing Structure",
+            "status": "insufficient_data",
+            "detail": "Borrowing profile outstanding not available",
+            "severity": "info",
+        }
+
+    # Check if total ALM outflows roughly match borrowing profile
+    total_outflows = sum(b.get("outflows", 0) for b in buckets.values())
+
+    if total_outflows > 0 and float(total_outstanding) > 0:
+        ratio = total_outflows / float(total_outstanding)
+        if 0.5 < ratio < 2:
+            return {
+                "check": "ALM vs Borrowing Structure",
+                "status": "confirmed",
+                "detail": f"ALM outflows ₹{total_outflows:.0f}Cr broadly match borrowing ₹{total_outstanding}Cr",
+                "severity": "ok",
+            }
+        else:
+            return {
+                "check": "ALM vs Borrowing Structure",
+                "status": "discrepancy",
+                "detail": f"ALM outflows ₹{total_outflows:.0f}Cr vs borrowing ₹{total_outstanding}Cr — mismatch of {ratio:.1f}x",
+                "severity": "medium",
+            }
+
+    return {
+        "check": "ALM vs Borrowing Structure",
+        "status": "insufficient_data",
+        "detail": "Cannot compare — zero values in ALM outflows or borrowing",
+        "severity": "info",
+    }
+
+
+def _generate_summary(confirmations: List[Dict], discrepancies: List[Dict], confidence: float) -> str:
+    """Generate human-readable triangulation summary."""
+    parts = [f"Data triangulation completed with {confidence:.0f}% confidence."]
+
+    if confirmations:
+        parts.append(f"\n✓ {len(confirmations)} cross-checks passed:")
+        for c in confirmations[:3]:
+            parts.append(f"  • {c['check']}: {c['detail']}")
+
+    if discrepancies:
+        parts.append(f"\n⚠ {len(discrepancies)} discrepancies found:")
+        for d in discrepancies:
+            parts.append(f"  • {d['check']}: {d['detail']}")
+
+    if not discrepancies:
+        parts.append("\nNo data discrepancies detected across document sources.")
+
+    return "\n".join(parts)
